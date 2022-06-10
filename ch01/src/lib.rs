@@ -167,8 +167,7 @@ mod tests {
         add_remove_groups, article_vote, get_articles, get_group_articles, post_article, Article,
     };
 
-    // Could be split into smaller tests and serialized, but for the sake of consistency I have it similar to
-    // https://github.com/josiahcarlson/redis-in-action/blob/master/python/ch01_listing_source.py#L270-L311
+    // Execute`cargo test -p ch01 -- --nocapture` to run these tests
     #[test]
     fn test_article_functionality() {
         let mut conn = redis::Client::open("redis://127.0.0.1")
