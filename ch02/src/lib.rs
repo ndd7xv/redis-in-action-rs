@@ -1,6 +1,8 @@
 use std::{
     cmp,
+    collections::hash_map::DefaultHasher,
     error::Error,
+    hash::{Hash, Hasher},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -10,6 +12,7 @@ use std::{
 };
 
 use redis::{Commands, Connection};
+use urlparse::urlparse;
 
 pub fn check_token(conn: &mut Connection, token: &str) -> Result<String, Box<dyn Error>> {
     Ok(conn.hget("login:", token)?)
@@ -31,6 +34,7 @@ pub fn update_token(
 
         conn.zadd(&viewed, item, timestamp)?;
         conn.zremrangebyrank(&viewed, 0, -26)?;
+        conn.zincr("viewed:", item, -1)?;
     }
     Ok(())
 }
@@ -122,6 +126,58 @@ pub fn clean_full_sessions(
     Ok(())
 }
 
+pub fn cache_request(
+    conn: &mut Connection,
+    request: &str,
+    callback: &dyn Fn(&str) -> String,
+) -> Result<String, Box<dyn Error>> {
+    if !can_cache(conn, request)? {
+        return Ok(callback(request));
+    }
+
+    let mut page_key = "cache:".to_owned();
+    page_key.push_str(&hash_request(request));
+    let content: String = conn.get(&page_key).unwrap_or_else(|_| callback(request));
+
+    conn.set_ex(&page_key, &content, 300_usize)?;
+
+    Ok(content)
+}
+
+pub fn can_cache(conn: &mut Connection, request: &str) -> Result<bool, Box<dyn Error>> {
+    let item_id = extract_item_id(request);
+    if item_id.is_none() || is_dynamic(request) {
+        return Ok(false);
+    }
+    let rank: Option<usize> = conn.zrank("viewed:", item_id)?;
+    Ok(rank.is_some() && rank.unwrap() < 10000)
+}
+
+// ---------------------- Below this line are helpers to test the code ----------------------
+fn extract_item_id(request: &str) -> Option<String> {
+    let parsed = urlparse(request);
+    if let Some(query) = parsed.get_parsed_query() {
+        if let Some(value) = query.get("item") {
+            return Some(value[0].clone());
+        }
+    }
+    None
+}
+
+fn is_dynamic(request: &str) -> bool {
+    let parsed = urlparse(request);
+    if let Some(query) = parsed.get_parsed_query() {
+        return query.contains_key("_");
+    }
+    false
+}
+
+fn hash_request(request: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    request.hash(&mut hasher);
+    hasher.finish().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -136,8 +192,10 @@ mod tests {
     use redis::Commands;
     use uuid::Uuid;
 
-    use crate::{add_to_cart, check_token, clean_full_sessions, clean_sessions, update_token};
-
+    use crate::{
+        add_to_cart, cache_request, can_cache, check_token, clean_full_sessions, clean_sessions,
+        update_token,
+    };
     // Execute`cargo test -p ch02 -- --nocapture --test-threads 1` to run these tests
     // specifying 1 test thread means one test runs at a time so things run sequentially
     #[test]
@@ -230,5 +288,46 @@ mod tests {
         let r: Vec<(String, String)> = conn.hgetall(&cart).unwrap();
         println!("Our shopping cart now contains: {r:?}");
         assert!(r.len() == 0);
+    }
+
+    #[test]
+    fn test_cache_request() {
+        let mut conn = redis::Client::open("redis://127.0.0.1")
+            .expect("Should be able to reach Redis Server")
+            .get_connection()
+            .expect("Should be able to Establish Connection");
+
+        let token = Uuid::new_v4().to_string();
+
+        fn callback(request: &str) -> String {
+            let mut content = "content for ".to_owned();
+            content.push_str(request);
+            content
+        }
+
+        update_token(&mut conn, &token, "username", Some("itemX")).expect("Token should update");
+        let url = "http://test.com/?item=itemX";
+        println!("We are going to cache a simple request against {url}");
+        let result =
+            cache_request(&mut conn, url, &callback).expect("Caching the request shouldn't err");
+        println!("We got initial content: {result}\n");
+
+        assert!(!result.is_empty());
+
+        println!("To test that we've cached the request, we'll pass a bad callback");
+        let result2 = cache_request(&mut conn, url, &|_request: &str| -> String {
+            String::new()
+        })
+        .expect("Caching the request shouldn't err");
+        println!("We ended up getting the same response! {result2}");
+
+        assert_eq!(result, result2);
+
+        assert!(!can_cache(&mut conn, "http://test.com")
+            .expect("Checking for ability to cache shouldn't err"));
+        assert!(
+            !can_cache(&mut conn, "http://test.com/?item=itemX&_=1234536")
+                .expect("Checking for ability to cache shouldn't err")
+        );
     }
 }
