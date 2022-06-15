@@ -44,10 +44,7 @@ pub fn clean_sessions(
     limit: isize,
     quit: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn Error>> {
-    loop {
-        if quit.load(Ordering::Relaxed) {
-            break;
-        }
+    while !quit.load(Ordering::Relaxed) {
         let size: isize = conn.zcard("recent:")?;
         if size <= limit {
             thread::sleep(Duration::from_secs(1));
@@ -94,10 +91,7 @@ pub fn clean_full_sessions(
     limit: isize,
     quit: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn Error>> {
-    loop {
-        if quit.load(Ordering::Relaxed) {
-            break;
-        }
+    while !quit.load(Ordering::Relaxed) {
         let size: isize = conn.zcard("recent:")?;
         if size <= limit {
             thread::sleep(Duration::from_secs(1));
@@ -153,6 +147,47 @@ pub fn can_cache(conn: &mut Connection, request: &str) -> Result<bool, Box<dyn E
     Ok(rank.is_some() && rank.unwrap() < 10000)
 }
 
+pub fn schedule_row_cache(
+    conn: &mut Connection,
+    row_id: &str,
+    delay: isize,
+) -> Result<(), Box<dyn Error>> {
+    conn.zadd("delay:", row_id, delay)?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as isize;
+    conn.zadd("schedule:", row_id, now)?;
+    Ok(())
+}
+
+pub fn cache_rows(conn: &mut Connection, quit: Arc<AtomicBool>) -> Result<(), Box<dyn Error>> {
+    while !quit.load(Ordering::Relaxed) {
+        let next: Vec<(String, isize)> = conn.zrange_withscores("schedule:", 0, 0)?;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as isize;
+        if next.is_empty() || next[0].1 > now {
+            thread::sleep(Duration::from_millis(50));
+            continue;
+        }
+
+        let row_id = next[0].0.to_string();
+        let delay: isize = conn.zscore("delay:", &row_id)?;
+        let mut inv = "inv:".to_owned();
+        inv.push_str(&row_id);
+
+        if delay <= 0 {
+            conn.zrem("delay:", &row_id)?;
+            conn.zrem("schedule:", &row_id)?;
+            conn.del(&inv)?;
+            continue;
+        }
+
+        // In a real scenario there might be more work to get it into a processable format,
+        // but for now an Inventory module is used to mock a real call to a database.
+        let row = Inventory::get(&row_id);
+        conn.zadd("schedule:", &row_id, now + delay)?;
+        conn.set(&inv, serde_json::to_string(&row)?)?;
+    }
+    Ok(())
+}
+
 // ---------------------- Below this line are helpers to test the code ----------------------
 fn extract_item_id(request: &str) -> Option<String> {
     let parsed = urlparse(request);
@@ -178,6 +213,30 @@ fn hash_request(request: &str) -> String {
     hasher.finish().to_string()
 }
 
+#[allow(non_snake_case)]
+mod Inventory {
+    use std::{
+        collections::BTreeMap,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    // Inventory::get() represents a call to the database for more information on a product with id row_id
+    // BTreeMap just so that printing it out gives consistent ordering to the fields
+    pub(crate) fn get(row_id: &str) -> BTreeMap<&str, String> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            .to_string();
+
+        BTreeMap::from([
+            ("id", row_id.to_owned()),
+            ("data", String::from("data to cache...")),
+            ("cached", now),
+        ])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -193,8 +252,8 @@ mod tests {
     use uuid::Uuid;
 
     use crate::{
-        add_to_cart, cache_request, can_cache, check_token, clean_full_sessions, clean_sessions,
-        update_token,
+        add_to_cart, cache_request, cache_rows, can_cache, check_token, clean_full_sessions,
+        clean_sessions, schedule_row_cache, update_token,
     };
     // Execute`cargo test -p ch02 -- --nocapture --test-threads 1` to run these tests
     // specifying 1 test thread means one test runs at a time so things run sequentially
@@ -329,5 +388,59 @@ mod tests {
             !can_cache(&mut conn, "http://test.com/?item=itemX&_=1234536")
                 .expect("Checking for ability to cache shouldn't err")
         );
+    }
+
+    #[test]
+    fn test_cache_rows() {
+        let mut conn = redis::Client::open("redis://127.0.0.1")
+            .expect("Should be able to reach Redis Server")
+            .get_connection()
+            .expect("Should be able to Establish Connection");
+
+        let quit = Arc::new(AtomicBool::new(false));
+
+        println!("First, let's schedule caching of itemX every 5 seconds");
+        schedule_row_cache(&mut conn, "itemX", 5)
+            .expect("itemX should be scheduled to cache every 5 seconds");
+        let s: Vec<(String, String)> = conn.zrange_withscores("schedule:", 0, -1).unwrap();
+        println!("Our schedule looks like: {s:?}");
+
+        println!("We'll start a caching thread that will cache the data...");
+        let signal = Arc::clone(&quit);
+        thread::spawn(move || cache_rows(&mut conn, signal).unwrap());
+        thread::sleep(Duration::from_millis(5)); // wait for cache_rows thread to cache
+
+        let mut conn = redis::Client::open("redis://127.0.0.1")
+            .expect("Should be able to reach Redis Server")
+            .get_connection()
+            .expect("Should be able to Establish Connection");
+        let r: String = conn.get("inv:itemX").unwrap();
+        println!("Our cached data looks like:\n{r}\n");
+        assert!(!r.is_empty());
+        println!("We'll check again in 5 seconds...");
+        thread::sleep(Duration::from_secs(5));
+        println!("Notice that the data has changed...");
+        let r2: String = conn.get("inv:itemX").unwrap();
+        println!("{r2}\n");
+        assert_ne!(r, r2);
+
+        println!("Let's force uncaching");
+        schedule_row_cache(&mut conn, "itemX", -1).unwrap();
+        thread::sleep(Duration::from_secs(1));
+        let r: Option<String> = conn.get("inv:itemX").unwrap();
+        println!(
+            "Was the cache cleared? {}\n",
+            if r.is_some() { "no" } else { "yes" }
+        );
+        assert!(r.is_none());
+
+        quit.store(true, Ordering::Relaxed);
+        thread::sleep(Duration::from_secs(1));
+
+        // Currently checking to see if the thread is still running by asserting that the only reference to the boolean
+        // is the test_login_cookies function; when it's stabilized, this could be replaced with t.is_running()
+        if Arc::strong_count(&quit) != 1 {
+            panic!("The database caching thread is still allive?!?");
+        }
     }
 }
