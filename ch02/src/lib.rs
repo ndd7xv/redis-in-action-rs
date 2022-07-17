@@ -188,6 +188,18 @@ pub fn cache_rows(conn: &mut Connection, quit: Arc<AtomicBool>) -> Result<(), Bo
     Ok(())
 }
 
+pub fn rescale_viewed(
+    conn: &mut Connection,
+    quit: Arc<AtomicBool>,
+) -> Result<bool, Box<dyn Error>> {
+    while !quit.load(Ordering::Relaxed) {
+        conn.zremrangebyrank("viewed:", 20000, -1)?;
+        conn.zinterstore_weights("viewed:", &[("viewed", 0.5)])?;
+        thread::sleep(Duration::from_secs(300));
+    }
+    Ok(false)
+}
+
 // ---------------------- Below this line are helpers to test the code ----------------------
 fn extract_item_id(request: &str) -> Option<String> {
     let parsed = urlparse(request);

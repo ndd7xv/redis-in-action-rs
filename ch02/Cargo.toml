@@ -6,7 +6,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-redis = "0.21.5"
+redis = { git = "https://github.com/ndd7xv/redis-rs", branch = "z-weights" } # Fork of redis-rs that contains zinterstore's weights option
 serde_json = "1.0"
 
 [dependencies.uuid]

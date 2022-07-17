@@ -29,14 +29,14 @@ checksum = "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd"
 name = "ch01"
 version = "0.1.0"
 dependencies = [
- "redis",
+ "redis 0.21.5 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
 name = "ch02"
 version = "0.1.0"
 dependencies = [
- "redis",
+ "redis 0.21.5 (git+https://github.com/ndd7xv/redis-rs?branch=z-weights)",
  "serde_json",
  "urlparse",
  "uuid",
@@ -192,6 +192,19 @@ dependencies = [
  "itoa 0.4.8",
  "percent-encoding",
  "sha1",
+ "url",
+]
+
+[[package]]
+name = "redis"
+version = "0.21.5"
+source = "git+https://github.com/ndd7xv/redis-rs?branch=z-weights#bbe06834b40708d6dabe8d3dafb33ac786189158"
+dependencies = [
+ "combine",
+ "itoa 1.0.2",
+ "percent-encoding",
+ "ryu",
+ "sha1_smol",
  "url",
 ]
 
